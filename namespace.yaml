@@ -1,0 +1,711 @@
+import io
+import json
+import math
+import os
+import shutil
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI, File, Form, Response, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from PIL import Image, ImageDraw
+
+APP_NAME = "bywaymap-enterprise"
+APP_VERSION = "4.1"
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
+SOURCE_DIR = DATA_DIR / "sources"
+BYWAY_SOURCE_DIR = SOURCE_DIR / "byways"
+TRO_SOURCE_DIR = SOURCE_DIR / "tros"
+MANUAL_BYWAY_DIR = BYWAY_SOURCE_DIR / "manual"
+MANUAL_TRO_DIR = TRO_SOURCE_DIR / "manual"
+FETCHED_DIR = SOURCE_DIR / "fetched"
+MERGED_DIR = DATA_DIR / "merged"
+TILE_ROOT = DATA_DIR / "tiles"
+PLAIN_TILE_DIR = TILE_ROOT / "boats"
+COLOUR_TILE_DIR = TILE_ROOT / "boats-coloured"
+
+SOURCES_PATH = DATA_DIR / "sources.json"
+STATUS_PATH = DATA_DIR / "status.json"
+OSM_GEOJSON_PATH = BYWAY_SOURCE_DIR / "osm-boats.geojson"
+MERGED_BYWAYS_PATH = MERGED_DIR / "byways.geojson"
+MERGED_TROS_PATH = MERGED_DIR / "tros.geojson"
+ANALYSED_BYWAYS_PATH = MERGED_DIR / "byways-with-tro-status.geojson"
+AUTHORITY_REGISTRY_PATH = Path(__file__).with_name("uk_authorities.json")
+
+OVERPASS_URL = os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://bywaymap.hornesys.co.uk").rstrip("/")
+UPDATE_HOUR = int(os.getenv("UPDATE_HOUR", "3"))
+MIN_ZOOM = int(os.getenv("MIN_ZOOM", "7"))
+MAX_ZOOM = int(os.getenv("MAX_ZOOM", "16"))
+PREGENERATE_MAX_ZOOM = int(os.getenv("PREGENERATE_MAX_ZOOM", "12"))
+TRO_MATCH_METRES = float(os.getenv("TRO_MATCH_METRES", "75"))
+
+DTRO_API_BASE_URL = os.getenv("DTRO_API_BASE_URL", "").strip()
+DTRO_API_KEY = os.getenv("DTRO_API_KEY", "").strip()
+DTRO_API_AUTH_HEADER = os.getenv("DTRO_API_AUTH_HEADER", "Authorization").strip()
+DTRO_API_AUTH_PREFIX = os.getenv("DTRO_API_AUTH_PREFIX", "Bearer").strip()
+
+OVERPASS_QUERY = """
+[out:json][timeout:900];
+area["ISO3166-1"="GB"][admin_level=2]->.uk;
+(
+  way(area.uk)["designation"="byway_open_to_all_traffic"];
+  relation(area.uk)["designation"="byway_open_to_all_traffic"];
+);
+out geom;
+"""
+
+app = FastAPI(title="BywayMap Enterprise 4.1")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS", "DELETE"],
+    allow_headers=["*"],
+)
+update_lock = threading.Lock()
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def ensure_dirs() -> None:
+    for d in [DATA_DIR, SOURCE_DIR, BYWAY_SOURCE_DIR, TRO_SOURCE_DIR, MANUAL_BYWAY_DIR, MANUAL_TRO_DIR, FETCHED_DIR, MERGED_DIR, PLAIN_TILE_DIR, COLOUR_TILE_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    tmp.replace(path)
+
+def save_status(payload: dict[str, Any]) -> None:
+    payload["updated_at"] = utc_now()
+    write_json_atomic(STATUS_PATH, payload)
+
+def load_status() -> dict[str, Any]:
+    return read_json(STATUS_PATH, {"service": APP_NAME, "version": APP_VERSION, "state": "never_updated"})
+
+def safe_id(value: str) -> str:
+    s = "".join(c.lower() if c.isalnum() else "-" for c in value).strip("-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s or f"source-{int(time.time())}"
+
+def default_sources() -> dict[str, Any]:
+    return {"sources": [{
+        "id": "osm-boats", "name": "OpenStreetMap BOAT query", "kind": "byway",
+        "type": "overpass_osm_boats", "enabled": True, "url": "",
+        "notes": "OSM designation=byway_open_to_all_traffic. Not legally authoritative.",
+        "created_at": utc_now(),
+    }, {
+        "id": "dft-dtro", "name": "DfT D-TRO API", "kind": "tro",
+        "type": "dtro_api", "enabled": False, "url": "",
+        "notes": "Enable after setting DTRO_API_BASE_URL and DTRO_API_KEY.",
+        "created_at": utc_now(),
+    }]}
+
+def load_sources() -> dict[str, Any]:
+    if not SOURCES_PATH.exists():
+        payload = default_sources()
+        write_json_atomic(SOURCES_PATH, payload)
+        return payload
+    return read_json(SOURCES_PATH, default_sources())
+
+def save_sources(payload: dict[str, Any]) -> None:
+    write_json_atomic(SOURCES_PATH, payload)
+
+def load_authority_registry() -> dict[str, Any]:
+    return read_json(AUTHORITY_REGISTRY_PATH, {"version": APP_VERSION, "authority_count": 0, "authorities": []})
+
+def authority_to_source_record(authority: dict[str, Any]) -> dict[str, Any]:
+    name = authority.get("name", "")
+    return {
+        "id": safe_id(f"tro-search-{name}"),
+        "name": f"{name} TRO source placeholder",
+        "kind": "tro",
+        "type": "authority_placeholder",
+        "enabled": False,
+        "url": "",
+        "notes": "Placeholder. Replace with GeoJSON/ArcGIS/D-TRO/council open-data URL when available.",
+        "authority_id": authority.get("id"),
+        "country": authority.get("country"),
+        "region": authority.get("region"),
+        "created_at": utc_now(),
+    }
+
+def ensure_authority_placeholders() -> dict[str, Any]:
+    registry = load_authority_registry()
+    payload = load_sources()
+    sources = payload.get("sources", [])
+    existing = {s.get("id") for s in sources}
+    added = 0
+    for auth in registry.get("authorities", []):
+        rec = authority_to_source_record(auth)
+        if rec["id"] not in existing:
+            sources.append(rec)
+            existing.add(rec["id"])
+            added += 1
+    payload["sources"] = sources
+    save_sources(payload)
+    return {"state": "done", "authority_count": registry.get("authority_count", len(registry.get("authorities", []))), "placeholders_added": added, "total_sources": len(sources)}
+
+def add_source_record(name: str, kind: str, source_type: str, url: str, notes: str = "", enabled: bool = True) -> dict[str, Any]:
+    source = {
+        "id": safe_id(f"{kind}-{name}-{int(time.time())}"),
+        "name": name,
+        "kind": kind,
+        "type": source_type,
+        "enabled": enabled,
+        "url": url.strip(),
+        "notes": notes,
+        "created_at": utc_now(),
+    }
+    payload = load_sources()
+    payload["sources"] = [s for s in payload.get("sources", []) if s.get("id") != source["id"]] + [source]
+    save_sources(payload)
+    return source
+
+def delete_source_id(source_id: str) -> bool:
+    payload = load_sources()
+    before = len(payload.get("sources", []))
+    payload["sources"] = [s for s in payload.get("sources", []) if s.get("id") != source_id]
+    save_sources(payload)
+    return len(payload["sources"]) != before
+
+def fetch_osm_boats() -> dict[str, Any]:
+    r = requests.get(OVERPASS_URL, params={"data": OVERPASS_QUERY}, headers={"User-Agent": "bywaymap-enterprise/4.1"}, timeout=1200)
+    r.raise_for_status()
+    osm = r.json()
+    features = []
+    for el in osm.get("elements", []):
+        if el.get("type") != "way":
+            continue
+        geom = el.get("geometry") or []
+        coords = [[p["lon"], p["lat"]] for p in geom if "lon" in p and "lat" in p]
+        if len(coords) < 2:
+            continue
+        tags = el.get("tags", {})
+        features.append({"type": "Feature", "properties": {
+            "osm_id": el.get("id"), "name": tags.get("name",""), "designation": tags.get("designation",""),
+            "highway": tags.get("highway",""), "surface": tags.get("surface",""), "source": "OpenStreetMap",
+            "source_id": "osm-boats", "confidence": "osm", "tro_status": "unchecked"
+        }, "geometry": {"type": "LineString", "coordinates": coords}})
+    return {"type": "FeatureCollection", "features": features}
+
+def source_fetch_path(source: dict[str, Any]) -> Path:
+    return FETCHED_DIR / source.get("kind", "unknown") / f"{safe_id(source.get('id','source'))}.geojson"
+
+def dtro_headers() -> dict[str, str]:
+    headers = {"User-Agent": "bywaymap-enterprise/4.1", "Accept": "application/json"}
+    if DTRO_API_KEY:
+        if DTRO_API_AUTH_PREFIX:
+            headers[DTRO_API_AUTH_HEADER] = f"{DTRO_API_AUTH_PREFIX} {DTRO_API_KEY}"
+        else:
+            headers[DTRO_API_AUTH_HEADER] = DTRO_API_KEY
+    return headers
+
+def fetch_dtro_api(source: dict[str, Any]) -> dict[str, Any]:
+    base_url = (source.get("url") or DTRO_API_BASE_URL).strip()
+    if not base_url:
+        raise RuntimeError("DTRO_API_BASE_URL is not configured")
+    r = requests.get(base_url, headers=dtro_headers(), timeout=900)
+    r.raise_for_status()
+    payload = r.json()
+    # If the configured API returns a FeatureCollection, use it directly.
+    if payload.get("type") == "FeatureCollection":
+        return payload
+    # Otherwise store raw features if common key exists.
+    for key in ("features", "data", "items", "results"):
+        if isinstance(payload.get(key), list):
+            return {"type": "FeatureCollection", "features": payload[key]}
+    return {"type": "FeatureCollection", "features": []}
+
+def fetch_external_sources() -> dict[str, Any]:
+    stats = {"fetched": 0, "skipped": 0, "errors": []}
+    for src in load_sources().get("sources", []):
+        if not src.get("enabled", True):
+            stats["skipped"] += 1
+            continue
+        stype = src.get("type")
+        try:
+            if stype == "overpass_osm_boats":
+                write_json_atomic(OSM_GEOJSON_PATH, fetch_osm_boats())
+                stats["fetched"] += 1
+            elif stype in ("geojson_url", "arcgis_geojson_url"):
+                url = src.get("url", "").strip()
+                if not url:
+                    stats["skipped"] += 1
+                    continue
+                r = requests.get(url, headers={"User-Agent": "bywaymap-enterprise/4.1", "Accept":"application/json"}, timeout=600)
+                r.raise_for_status()
+                write_json_atomic(source_fetch_path(src), r.json())
+                stats["fetched"] += 1
+            elif stype == "dtro_api":
+                write_json_atomic(source_fetch_path(src), fetch_dtro_api(src))
+                stats["fetched"] += 1
+            elif stype in ("manual_upload", "authority_placeholder", "text_only_url"):
+                stats["skipped"] += 1
+                continue
+            else:
+                stats["errors"].append({"source": src.get("id"), "error": f"unsupported type {stype}"})
+        except Exception as exc:
+            stats["errors"].append({"source": src.get("id"), "error": str(exc)})
+    return stats
+
+def feature_text(feature: dict[str, Any]) -> str:
+    return json.dumps(feature.get("properties", {}), ensure_ascii=False).lower()
+
+def is_boat_like(feature: dict[str, Any]) -> bool:
+    text = feature_text(feature)
+    return "byway_open_to_all_traffic" in text or "byway open to all traffic" in text or "boat" in text or "public byway" in text or " byway" in text
+
+def is_tro_like(feature: dict[str, Any]) -> bool:
+    text = feature_text(feature)
+    return any(t in text for t in ["traffic regulation order","tro","temporary traffic regulation","prohibition","restriction","closure","no motor","motor vehicle","seasonal","experimental traffic","traffic order"])
+
+def normalise_feature(feature: dict[str, Any], kind: str, source_name: str, source_id: str) -> list[dict[str, Any]]:
+    geom = feature.get("geometry") or {}
+    props = feature.get("properties") or {}
+    lines = []
+    if geom.get("type") == "LineString":
+        lines = [geom.get("coordinates") or []]
+    elif geom.get("type") == "MultiLineString":
+        lines = geom.get("coordinates") or []
+    elif geom.get("type") == "Polygon":
+        rings = geom.get("coordinates") or []
+        lines = rings[:1]
+    elif geom.get("type") == "MultiPolygon":
+        for poly in geom.get("coordinates") or []:
+            if poly:
+                lines.append(poly[0])
+    out = []
+    for coords in lines:
+        clean = []
+        for c in coords:
+            if len(c) >= 2:
+                try:
+                    clean.append([float(c[0]), float(c[1])])
+                except Exception:
+                    pass
+        if len(clean) < 2:
+            continue
+        if kind == "byway" and source_name != "OpenStreetMap" and not is_boat_like(feature):
+            continue
+        confidence = "matched_keywords" if (kind == "tro" and is_tro_like(feature)) else ("low" if kind == "tro" else "authority_or_manual")
+        name = props.get("name") or props.get("NAME") or props.get("roadName") or props.get("road_name") or props.get("street") or props.get("PROW_REF") or props.get("reference") or ""
+        designation = props.get("designation") or props.get("DESIGNATION") or props.get("type") or props.get("Type") or ""
+        out.append({"type":"Feature","properties":{
+            "name": str(name or ""), "designation": str(designation or ""), "source": source_name,
+            "source_id": source_id, "source_kind": kind, "confidence": confidence, "raw_properties": props
+        }, "geometry":{"type":"LineString","coordinates":clean}})
+    return out
+
+def load_geojson_features(path: Path, kind: str, source_name: str, source_id: str) -> list[dict[str, Any]]:
+    geojson = read_json(path, {"type":"FeatureCollection","features":[]})
+    out = []
+    for feat in geojson.get("features", []):
+        out.extend(normalise_feature(feat, kind, source_name, source_id))
+    return out
+
+def dedupe_features(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen, out = set(), []
+    for f in features:
+        coords = f.get("geometry", {}).get("coordinates", [])
+        if not coords:
+            continue
+        key = tuple((round(c[0],6), round(c[1],6)) for c in coords[:3]+coords[-3:])
+        props = f.get("properties", {})
+        k = (key, props.get("source_id",""), props.get("name",""))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(f)
+    return out
+
+def merge_sources() -> tuple[dict[str, Any], dict[str, Any]]:
+    byways, tros = [], []
+    byways += load_geojson_features(OSM_GEOJSON_PATH, "byway", "OpenStreetMap", "osm-boats")
+    for p in sorted((FETCHED_DIR/"byway").glob("*.geojson")):
+        byways += load_geojson_features(p, "byway", "external-byway-source", p.stem)
+    for p in sorted(MANUAL_BYWAY_DIR.glob("*.geojson")) + sorted(MANUAL_BYWAY_DIR.glob("*.json")):
+        byways += load_geojson_features(p, "byway", "manual-byway-upload", p.stem)
+    for p in sorted((FETCHED_DIR/"tro").glob("*.geojson")):
+        tros += load_geojson_features(p, "tro", "external-tro-source", p.stem)
+    for p in sorted(MANUAL_TRO_DIR.glob("*.geojson")) + sorted(MANUAL_TRO_DIR.glob("*.json")):
+        tros += load_geojson_features(p, "tro", "manual-tro-upload", p.stem)
+    byways_fc = {"type":"FeatureCollection","features":dedupe_features(byways)}
+    tros_fc = {"type":"FeatureCollection","features":dedupe_features(tros)}
+    write_json_atomic(MERGED_BYWAYS_PATH, byways_fc)
+    write_json_atomic(MERGED_TROS_PATH, tros_fc)
+    return byways_fc, tros_fc
+
+def bbox(feature):
+    coords = feature.get("geometry", {}).get("coordinates", [])
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return min(xs), min(ys), max(xs), max(ys)
+
+def bbox_intersects(a,b,buf):
+    return not (a[2]+buf < b[0] or a[0]-buf > b[2] or a[3]+buf < b[1] or a[1]-buf > b[3])
+
+def approx_xy(lon, lat, ref_lat):
+    return lon*111320.0*math.cos(math.radians(ref_lat)), lat*110540.0
+
+def point_seg_dist(p,a,b,ref_lat):
+    px,py = approx_xy(p[0],p[1],ref_lat)
+    ax,ay = approx_xy(a[0],a[1],ref_lat)
+    bx,by = approx_xy(b[0],b[1],ref_lat)
+    dx,dy=bx-ax,by-ay
+    if dx==0 and dy==0:
+        return math.hypot(px-ax,py-ay)
+    t=max(0,min(1,((px-ax)*dx+(py-ay)*dy)/(dx*dx+dy*dy)))
+    return math.hypot(px-(ax+t*dx),py-(ay+t*dy))
+
+def line_distance(a,b):
+    if not a or not b:
+        return float("inf")
+    lats=[p[1] for p in (a[:10]+b[:10])]
+    ref=sum(lats)/len(lats)
+    best=float("inf")
+    for p in a:
+        for i in range(len(b)-1):
+            best=min(best, point_seg_dist(p,b[i],b[i+1],ref))
+            if best <= 1:
+                return best
+    for p in b:
+        for i in range(len(a)-1):
+            best=min(best, point_seg_dist(p,a[i],a[i+1],ref))
+            if best <= 1:
+                return best
+    return best
+
+def classify_tro(tro):
+    text=feature_text(tro)
+    if any(t in text for t in ["closure","closed","prohibition","no motor","motor vehicle","traffic regulation order"]):
+        return "restricted"
+    return "possible"
+
+def analyse_tros(byways, tros):
+    tro_items=[]
+    for tro in tros.get("features", []):
+        try:
+            tro_items.append((tro,bbox(tro)))
+        except Exception:
+            pass
+    buf_deg=TRO_MATCH_METRES/111320.0
+    analysed=[]
+    for by in byways.get("features", []):
+        props=by.get("properties", {}).copy()
+        by_coords=by.get("geometry", {}).get("coordinates", [])
+        try:
+            by_bbox=bbox(by)
+        except Exception:
+            continue
+        matches=[]
+        status="clear"
+        for tro,tb in tro_items:
+            if not bbox_intersects(by_bbox,tb,buf_deg):
+                continue
+            dist=line_distance(by_coords,tro.get("geometry",{}).get("coordinates",[]))
+            if dist <= TRO_MATCH_METRES:
+                st=classify_tro(tro)
+                if st=="restricted":
+                    status="restricted"
+                elif status!="restricted":
+                    status="possible"
+                tp=tro.get("properties", {})
+                matches.append({"distance_m":round(dist,1),"status":st,"source":tp.get("source",""),"source_id":tp.get("source_id",""),"name":tp.get("name","")})
+        props["tro_status"]=status
+        props["tro_match_count"]=len(matches)
+        props["tro_matches"]=matches[:10]
+        props["tro_checked_at"]=utc_now()
+        analysed.append({"type":"Feature","properties":props,"geometry":by.get("geometry")})
+    fc={"type":"FeatureCollection","features":analysed}
+    write_json_atomic(ANALYSED_BYWAYS_PATH, fc)
+    return fc
+
+def lonlat_to_pixel(lon,lat,z):
+    lat=max(min(lat,85.05112878),-85.05112878)
+    n=2**z
+    x=(lon+180)/360*n*256
+    r=math.radians(lat)
+    y=(1-math.log(math.tan(r)+1/math.cos(r))/math.pi)/2*n*256
+    return x,y
+
+def lonlat_to_tile(lon,lat,z):
+    px,py=lonlat_to_pixel(lon,lat,z)
+    return int(px//256), int(py//256)
+
+def feature_tile_bounds(f,z):
+    coords=f.get("geometry",{}).get("coordinates",[])
+    if not coords:
+        return None
+    xs=[]
+    ys=[]
+    for lon,lat in coords:
+        tx,ty=lonlat_to_tile(lon,lat,z)
+        xs.append(tx)
+        ys.append(ty)
+    return min(xs),min(ys),max(xs),max(ys)
+
+def spatial_index(features,z):
+    idx={}
+    for f in features:
+        b=feature_tile_bounds(f,z)
+        if not b:
+            continue
+        minx,miny,maxx,maxy=b
+        for x in range(max(0,minx-1),maxx+2):
+            for y in range(max(0,miny-1),maxy+2):
+                idx.setdefault((x,y),[]).append(f)
+    return idx
+
+def colour(f, coloured):
+    p=f.get("properties",{})
+    if coloured:
+        st=p.get("tro_status","unknown")
+        return {"restricted":(220,38,38,240),"possible":(245,158,11,240),"clear":(22,163,74,235)}.get(st,(107,114,128,230))
+    src=p.get("source","")
+    if src=="OpenStreetMap":
+        return (215,25,28,230)
+    if "manual" in src:
+        return (255,140,0,235)
+    return (0,120,255,235)
+
+def render_tile(z,x,y,features,coloured):
+    img=Image.new("RGBA",(256,256),(0,0,0,0))
+    draw=ImageDraw.Draw(img)
+    ox,oy=x*256,y*256
+    width=2 if z<11 else 3 if z<15 else 5
+    for f in features:
+        pts=[]
+        for c in f.get("geometry",{}).get("coordinates",[]):
+            px,py=lonlat_to_pixel(c[0],c[1],z)
+            pts.append((px-ox,py-oy))
+        if len(pts)<2:
+            continue
+        if not any(-64<=px<=320 and -64<=py<=320 for px,py in pts):
+            continue
+        draw.line(pts, fill=colour(f,coloured), width=width)
+        if z>=14:
+            draw.line(pts, fill=(255,255,255,165), width=max(1,width//2))
+    buf=io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def clear_tiles():
+    for d in [PLAIN_TILE_DIR, COLOUR_TILE_DIR]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+def pregenerate(features):
+    clear_tiles()
+    stats={"plain":{"total_tiles":0,"per_zoom":{}},"coloured":{"total_tiles":0,"per_zoom":{}}}
+    for z in range(MIN_ZOOM, PREGENERATE_MAX_ZOOM+1):
+        idx=spatial_index(features,z)
+        for tile_dir, coloured, key in [(PLAIN_TILE_DIR,False,"plain"),(COLOUR_TILE_DIR,True,"coloured")]:
+            count=0
+            for (x,y), feats in idx.items():
+                p=tile_dir/str(z)/str(x)/f"{y}.png"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(render_tile(z,x,y,feats,coloured))
+                count+=1
+            stats[key]["per_zoom"][str(z)]=count
+            stats[key]["total_tiles"]+=count
+    return stats
+
+def update_all():
+    if not update_lock.acquire(blocking=False):
+        return {"service":APP_NAME,"state":"already_running"}
+    started=time.time()
+    try:
+        ensure_dirs()
+        save_status({"service":APP_NAME,"version":APP_VERSION,"state":"updating","stage":"fetching_sources","started_at":utc_now()})
+        fetch_stats=fetch_external_sources()
+        save_status({"service":APP_NAME,"version":APP_VERSION,"state":"updating","stage":"merging_sources","fetch_stats":fetch_stats})
+        byways,tros=merge_sources()
+        save_status({"service":APP_NAME,"version":APP_VERSION,"state":"updating","stage":"matching_tros","byway_count":len(byways["features"]),"tro_count":len(tros["features"])})
+        analysed=analyse_tros(byways,tros)
+        features=analysed.get("features",[])
+        save_status({"service":APP_NAME,"version":APP_VERSION,"state":"updating","stage":"pregenerating_tiles","feature_count":len(features)})
+        tile_stats=pregenerate(features)
+        counts={}
+        for f in features:
+            st=f.get("properties",{}).get("tro_status","unknown")
+            counts[st]=counts.get(st,0)+1
+        status={"service":APP_NAME,"version":APP_VERSION,"state":"ready","feature_count":len(features),"tro_feature_count":len(tros["features"]),
+                "tro_status_counts":counts,"fetch_stats":fetch_stats,"authority_count":load_authority_registry().get("authority_count",0),
+                "elapsed_seconds":round(time.time()-started,1),"tile_stats":tile_stats,
+                "traccar_coloured_tile_url":f"{PUBLIC_BASE_URL}/tiles/boats-coloured/{{z}}/{{x}}/{{y}}.png",
+                "traccar_plain_tile_url":f"{PUBLIC_BASE_URL}/tiles/boats/{{z}}/{{x}}/{{y}}.png",
+                "legend":{"green":"no imported TRO match","amber":"possible TRO match","red":"likely restriction/closure","grey":"unknown"},
+                "legal_note":"Overlay aid only. Check local authority Definitive Maps and TROs."}
+        save_status(status)
+        return load_status()
+    except Exception as exc:
+        save_status({"service":APP_NAME,"version":APP_VERSION,"state":"error","error":str(exc)})
+        return load_status()
+    finally:
+        update_lock.release()
+
+def tile_bytes(tile_dir,z,x,y,coloured):
+    if z<0 or z>22:
+        return None
+    p=tile_dir/str(z)/str(x)/f"{y}.png"
+    if p.exists():
+        return p.read_bytes()
+    if z<=MAX_ZOOM:
+        feats=read_json(ANALYSED_BYWAYS_PATH, {"type":"FeatureCollection","features":[]}).get("features",[])
+        data=render_tile(z,x,y,feats,coloured)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return data
+    img=Image.new("RGBA",(256,256),(0,0,0,0))
+    buf=io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def png_response(data):
+    return Response(content=data, media_type="image/png", headers={"Cache-Control":"public, max-age=86400","Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"GET, HEAD, OPTIONS","Access-Control-Allow-Headers":"*"})
+
+def source_rows():
+    rows=""
+    for s in load_sources().get("sources", []):
+        rows += f"<tr><td><code>{s.get('id','')}</code></td><td>{s.get('name','')}</td><td>{s.get('kind','')}</td><td>{s.get('type','')}</td><td>{s.get('enabled',True)}</td><td style='max-width:380px;overflow-wrap:anywhere'>{s.get('url','')}</td><td><button onclick=\"delSource('{s.get('id','')}')\">Delete</button></td></tr>"
+    return rows
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    status=json.dumps(load_status(), indent=2)
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>BywayMap Enterprise 4.1</title><style>
+body{{font-family:Arial;margin:0;background:#f3f4f6;color:#111827}} header{{background:#111827;color:white;padding:20px}} main{{padding:22px;max-width:1300px;margin:auto}} section{{background:white;border-radius:12px;padding:18px;margin-bottom:16px;box-shadow:0 1px 4px #0002}} input,select,textarea{{width:100%;padding:8px;margin:4px 0 10px;box-sizing:border-box}} button{{padding:9px 12px;border:0;border-radius:8px;background:#dc2626;color:white;margin:3px;cursor:pointer}} .secondary{{background:#374151}} code,pre{{background:#f1f5f9;padding:5px;border-radius:6px}} table{{width:100%;border-collapse:collapse;font-size:13px}} td,th{{border-bottom:1px solid #e5e7eb;padding:7px;text-align:left;vertical-align:top}}</style></head>
+<body><header><h1>BywayMap Enterprise 4.1</h1><div>UK authorities + byways + D-TRO/TRO colour-coded overlay for Traccar</div></header><main>
+<section><h2>Traccar URLs</h2><p><b>Colour-coded:</b> <code>{PUBLIC_BASE_URL}/tiles/boats-coloured/{{z}}/{{x}}/{{y}}.png</code></p><p><b>Plain:</b> <code>{PUBLIC_BASE_URL}/tiles/boats/{{z}}/{{x}}/{{y}}.png</code></p></section>
+<section><h2>Controls</h2><button onclick='runUpdate()'>Full Update + TRO Match + Rebuild Tiles</button><button class='secondary' onclick='loadStatus()'>Refresh Status</button><button class='secondary' onclick='addAuthorities()'>Add All UK Authority Placeholders</button><button class='secondary' onclick='showAuthorities()'>Show Authority Registry</button></section>
+<section><h2>Add data source URL</h2><label>Name</label><input id='sourceName'><label>Kind</label><select id='sourceKind'><option value='tro'>TRO source</option><option value='byway'>Byway source</option></select><label>Type</label><select id='sourceType'><option value='geojson_url'>GeoJSON URL</option><option value='arcgis_geojson_url'>ArcGIS GeoJSON query URL</option><option value='dtro_api'>D-TRO API</option><option value='text_only_url'>Text-only council page placeholder</option></select><label>URL</label><input id='sourceUrl'><label>Notes</label><textarea id='sourceNotes'></textarea><button onclick='addSource()'>Add Source</button></section>
+<section><h2>Manual GeoJSON upload</h2><select id='uploadKind'><option value='tro'>TRO GeoJSON</option><option value='byway'>Byway GeoJSON</option></select><input id='file' type='file' accept='.geojson,.json'><button onclick='uploadFile()'>Upload</button></section>
+<section><h2>Sources</h2><table><thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Type</th><th>Enabled</th><th>URL</th><th>Action</th></tr></thead><tbody>{source_rows()}</tbody></table></section>
+<section><h2>Status</h2><pre id='status'>{status}</pre></section>
+<section><h2>Legend</h2><p><b style='color:#16a34a'>Green</b> no imported TRO match · <b style='color:#d97706'>Amber</b> possible TRO · <b style='color:#dc2626'>Red</b> likely restriction/closure · <b style='color:#6b7280'>Grey</b> unknown</p><p>Legal note: this is an overlay aid only. Check local authority Definitive Maps and TROs.</p></section>
+</main><script>
+async function loadStatus(){{let r=await fetch('/status');document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2)}}
+async function runUpdate(){{document.getElementById('status').textContent='Running update...';let r=await fetch('/update',{{method:'POST'}});document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);}}
+async function addAuthorities(){{let r=await fetch('/authorities/add-placeholders',{{method:'POST'}});document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);location.reload();}}
+async function showAuthorities(){{let r=await fetch('/authorities');document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2)}}
+async function addSource(){{let b=new URLSearchParams();b.set('name',document.getElementById('sourceName').value);b.set('kind',document.getElementById('sourceKind').value);b.set('source_type',document.getElementById('sourceType').value);b.set('url',document.getElementById('sourceUrl').value);b.set('notes',document.getElementById('sourceNotes').value);let r=await fetch('/sources/add',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:b}});document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);location.reload();}}
+async function delSource(id){{let r=await fetch('/sources/delete/'+encodeURIComponent(id),{{method:'POST'}});document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);location.reload();}}
+async function uploadFile(){{let input=document.getElementById('file'); if(!input.files.length){{alert('Choose a file');return}} let f=new FormData(); f.append('kind',document.getElementById('uploadKind').value); f.append('file',input.files[0]); let r=await fetch('/upload-geojson',{{method:'POST',body:f}}); document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);}}
+</script></body></html>"""
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": APP_NAME, "version": APP_VERSION}
+
+@app.get("/status")
+def status():
+    return JSONResponse(load_status())
+
+@app.get("/authorities")
+def authorities():
+    return JSONResponse(load_authority_registry())
+
+@app.post("/authorities/add-placeholders")
+def authorities_add_placeholders():
+    return JSONResponse(ensure_authority_placeholders())
+
+@app.get("/sources")
+def sources():
+    return JSONResponse(load_sources())
+
+@app.post("/sources/add")
+def add_source(name: str = Form(...), kind: str = Form(...), source_type: str = Form(...), url: str = Form(""), notes: str = Form("")):
+    if kind not in ("byway","tro"):
+        return JSONResponse({"state":"error","error":"kind must be byway or tro"}, status_code=400)
+    if source_type not in ("geojson_url","arcgis_geojson_url","dtro_api","text_only_url"):
+        return JSONResponse({"state":"error","error":"unsupported source_type"}, status_code=400)
+    if source_type not in ("text_only_url", "dtro_api"):
+        parsed=urlparse(url)
+        if parsed.scheme not in ("http","https"):
+            return JSONResponse({"state":"error","error":"URL must start with http or https"}, status_code=400)
+    return JSONResponse({"state":"added","source":add_source_record(name, kind, source_type, url, notes)})
+
+@app.post("/sources/delete/{source_id}")
+def delete_source(source_id: str):
+    return JSONResponse({"state":"deleted" if delete_source_id(source_id) else "not_found","source_id":source_id})
+
+@app.post("/upload-geojson")
+async def upload_geojson(kind: str = Form(...), file: UploadFile = File(...)):
+    if kind not in ("byway","tro"):
+        return JSONResponse({"state":"error","error":"kind must be byway or tro"}, status_code=400)
+    safe="".join(c for c in file.filename if c.isalnum() or c in ("-","_","."," ")).strip() or f"upload-{int(time.time())}.geojson"
+    if not safe.endswith((".geojson",".json")):
+        safe += ".geojson"
+    content=await file.read()
+    try:
+        json.loads(content.decode("utf-8"))
+    except Exception as exc:
+        return JSONResponse({"state":"error","error":f"invalid JSON: {exc}"}, status_code=400)
+    target=(MANUAL_BYWAY_DIR if kind=="byway" else MANUAL_TRO_DIR)/safe
+    ensure_dirs()
+    target.write_bytes(content)
+    rec=add_source_record(safe, kind, "manual_upload", str(target), "Uploaded from web UI")
+    return JSONResponse({"state":"uploaded","file":str(target),"source":rec,"note":"Run full update to merge it."})
+
+@app.post("/update")
+def manual_update():
+    return JSONResponse(update_all())
+
+@app.get("/geojson/byways")
+def geojson_byways():
+    return JSONResponse(read_json(MERGED_BYWAYS_PATH, {"type":"FeatureCollection","features":[]}))
+
+@app.get("/geojson/tros")
+def geojson_tros():
+    return JSONResponse(read_json(MERGED_TROS_PATH, {"type":"FeatureCollection","features":[]}))
+
+@app.get("/geojson/analysed")
+def geojson_analysed():
+    return JSONResponse(read_json(ANALYSED_BYWAYS_PATH, {"type":"FeatureCollection","features":[]}))
+
+@app.get("/tiles/boats/{z}/{x}/{y}.png")
+@app.head("/tiles/boats/{z}/{x}/{y}.png")
+def plain_tile(z:int,x:int,y:int):
+    data=tile_bytes(PLAIN_TILE_DIR,z,x,y,False)
+    if data is None:
+        return Response(status_code=400, content=b"Invalid zoom")
+    return png_response(data)
+
+@app.get("/tiles/boats-coloured/{z}/{x}/{y}.png")
+@app.head("/tiles/boats-coloured/{z}/{x}/{y}.png")
+def coloured_tile(z:int,x:int,y:int):
+    data=tile_bytes(COLOUR_TILE_DIR,z,x,y,True)
+    if data is None:
+        return Response(status_code=400, content=b"Invalid zoom")
+    return png_response(data)
+
+@app.on_event("startup")
+def startup():
+    ensure_dirs()
+    load_sources()
+    scheduler=BackgroundScheduler()
+    scheduler.add_job(update_all, "cron", hour=UPDATE_HOUR, minute=0)
+    scheduler.start()
+    if not ANALYSED_BYWAYS_PATH.exists():
+        threading.Thread(target=update_all, daemon=True).start()
