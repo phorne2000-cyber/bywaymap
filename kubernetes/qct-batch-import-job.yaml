@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hotsausage-qct-batch-import
+  namespace: office
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: hotsausage-qct-batch-import
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: qct-batch-import
+          image: python:3.12-slim
+          env:
+            - name: BYWAYMAP_URL
+              value: "http://bywaymap.office.svc.cluster.local"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              python - <<'PY'
+              import json
+              import os
+              import sys
+              import time
+              import urllib.error
+              import urllib.request
+
+              base = os.environ.get("BYWAYMAP_URL", "http://bywaymap.office.svc.cluster.local").rstrip("/")
+
+              def get_json(path):
+                  with urllib.request.urlopen(base + path, timeout=60) as r:
+                      return json.loads(r.read().decode("utf-8"))
+
+              def post_json(path):
+                  req = urllib.request.Request(base + path, method="POST")
+                  with urllib.request.urlopen(req, timeout=3600) as r:
+                      data = r.read().decode("utf-8")
+                      try:
+                          return json.loads(data)
+                      except Exception:
+                          return {"raw": data}
+
+              print(f"Using BywayMap URL: {base}")
+
+              maps = get_json("/maps/list").get("maps", [])
+              print(f"Found {len(maps)} registered maps")
+
+              imported = 0
+              skipped = 0
+              failed = 0
+
+              for m in maps:
+                  mid = m.get("id")
+                  status = m.get("status")
+                  name = m.get("name")
+                  if not mid:
+                      skipped += 1
+                      continue
+
+                  if status == "ready":
+                      print(f"SKIP ready: {name} ({mid})")
+                      skipped += 1
+                      continue
+
+                  print(f"IMPORT: {name} ({mid}) status={status}")
+                  try:
+                      result = post_json(f"/maps/{mid}/import")
+                      print(json.dumps(result)[:1000])
+                      if result.get("state") == "ready":
+                          imported += 1
+                      else:
+                          failed += 1
+                  except urllib.error.HTTPError as e:
+                      failed += 1
+                      print(f"HTTP ERROR importing {mid}: {e.code} {e.read().decode('utf-8', 'ignore')[:1000]}")
+                  except Exception as e:
+                      failed += 1
+                      print(f"ERROR importing {mid}: {e}")
+
+                  time.sleep(1)
+
+              print(json.dumps({
+                  "state": "complete",
+                  "imported": imported,
+                  "skipped": skipped,
+                  "failed": failed
+              }, indent=2))
+
+              if failed:
+                  sys.exit(1)
+              PY

@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hotsausage-nightly
+  namespace: office
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: nightly-update
+              image: curlimages/curl:8.10.1
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  curl -fsS -X POST http://bywaymap.office.svc.cluster.local/update
+                  curl -fsS -X POST http://bywaymap.office.svc.cluster.local/cache/rebuild || true

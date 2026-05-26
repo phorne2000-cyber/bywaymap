@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bywaymap
+  namespace: office
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bywaymap
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: bywaymap
+    spec:
+      containers:
+        - name: bywaymap
+          image: criticalmass303/bywaymap:6.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: bywaymap-config
+          env:
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hotsausage-admin
+                  key: ADMIN_PASSWORD
+            - name: DTRO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bywaymap-dtro
+                  key: DTRO_API_KEY
+                  optional: true
+            - name: DTRO_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: bywaymap-dtro
+                  key: DTRO_APP_ID
+                  optional: true
+            - name: DTRO_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: bywaymap-dtro
+                  key: DTRO_API_SECRET
+                  optional: true
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "384Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 8
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: bywaymap-storage
+              mountPath: /data
+      volumes:
+        - name: bywaymap-storage
+          persistentVolumeClaim:
+            claimName: bywaymap-pvc
